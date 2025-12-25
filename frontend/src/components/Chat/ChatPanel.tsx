@@ -4,7 +4,7 @@
 
 import { useRef, useEffect } from 'react';
 import { Sender } from '@ant-design/x';
-import { Typography, Space, Tag, Spin, Avatar, Button } from 'antd';
+import { Typography, Tag, Spin, Avatar, Button } from 'antd';
 import {
   RobotOutlined,
   UserOutlined,
