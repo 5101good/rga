@@ -545,6 +545,123 @@ class AgentBayService:
         """Get session by ID."""
         return self._sessions.get(session_id)
     
+    async def restore_session(self, agentbay_session_id: str, device_id: str) -> Optional[str]:
+        """
+        Try to restore a session after service restart.
+        
+        This attempts to:
+        1. Reconnect to the existing AgentBay session
+        2. Refresh the resource_url
+        3. Reconnect ADB
+        
+        Args:
+            agentbay_session_id: The AgentBay session ID to restore
+            device_id: The device ID (IP:PORT) to reconnect
+            
+        Returns:
+            New resource_url if successful (both session and ADB reconnected), None otherwise
+        """
+        logger.info(f"Attempting to restore session {agentbay_session_id}...")
+        
+        try:
+            # Check if we already have the session in memory
+            session = self._sessions.get(agentbay_session_id)
+            logger.debug(f"Session in memory: {session is not None}")
+            
+            if not session:
+                # Try to get session from AgentBay API (if SDK supports it)
+                if hasattr(self.client, 'get_session'):
+                    logger.debug("Calling AgentBay get_session API...")
+                    session = self.client.get_session(agentbay_session_id)
+                    logger.debug(f"AgentBay get_session result: {session is not None}")
+                else:
+                    logger.warning("AgentBay SDK does not support get_session method")
+                    return None
+            
+            if not session:
+                logger.warning(f"Session {agentbay_session_id} not found in AgentBay (expired or deleted)")
+                return None
+            
+            # Store session reference
+            self._sessions[agentbay_session_id] = session
+            
+            # Get new resource URL
+            new_resource_url = getattr(session, 'resource_url', None)
+            if new_resource_url:
+                logger.info(f"Got new resource URL for session {agentbay_session_id}")
+            else:
+                logger.warning(f"Session {agentbay_session_id} has no resource_url")
+            
+            # Try to get new ADB URL and reconnect - this is required for success
+            adb_connected = False
+            try:
+                adbkey_pub = self._load_adb_public_key()
+                if hasattr(session, 'mobile') and hasattr(session.mobile, 'get_adb_url'):
+                    logger.debug("Getting new ADB URL from AgentBay...")
+                    adb_result = session.mobile.get_adb_url(adbkey_pub=adbkey_pub)
+                    logger.debug(f"ADB URL result: success={adb_result.success}")
+                    
+                    if adb_result.success:
+                        adb_url = adb_result.data  # "adb connect IP:PORT"
+                        address = adb_url.replace("adb connect ", "")
+                        logger.info(f"Got new ADB address: {address}")
+                        
+                        # Connect via ADB
+                        success, connected_device_id = await self._connect_adb(address)
+                        if success:
+                            self._adb_addresses[agentbay_session_id] = address
+                            logger.info(f"ADB reconnected to {connected_device_id}")
+                            adb_connected = True
+                        else:
+                            logger.warning(f"Failed to connect ADB to {address}")
+                    else:
+                        logger.warning(f"Failed to get ADB URL: {getattr(adb_result, 'error_message', 'unknown')}")
+                else:
+                    logger.warning("Session does not have mobile.get_adb_url method")
+            except Exception as e:
+                logger.warning(f"Failed to refresh ADB connection: {e}")
+            
+            # Only return resource_url if ADB was successfully connected
+            if adb_connected and new_resource_url:
+                return new_resource_url
+            else:
+                logger.warning(f"Session restore incomplete: adb_connected={adb_connected}, has_url={new_resource_url is not None}")
+                return None
+            
+        except Exception as e:
+            logger.error(f"Failed to restore session {agentbay_session_id}: {e}")
+            return None
+    
+    async def refresh_resource_url(self, agentbay_session_id: str) -> Optional[str]:
+        """
+        Refresh the resource URL for an existing session.
+        
+        Args:
+            agentbay_session_id: The AgentBay session ID
+            
+        Returns:
+            New resource_url if successful, None otherwise
+        """
+        try:
+            # Check if we have the session in memory
+            session = self._sessions.get(agentbay_session_id)
+            
+            if not session:
+                # Try to get from AgentBay API (if SDK supports it)
+                if hasattr(self.client, 'get_session'):
+                    session = self.client.get_session(agentbay_session_id)
+                    if session:
+                        self._sessions[agentbay_session_id] = session
+            
+            if session and hasattr(session, 'resource_url'):
+                return session.resource_url
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Failed to refresh resource URL: {e}")
+            return None
+    
     def get_device_id(self, session_id: str) -> Optional[str]:
         """
         Get ADB device ID for a session.

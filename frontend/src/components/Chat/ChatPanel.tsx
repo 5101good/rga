@@ -247,6 +247,9 @@ export function ChatPanel({ onSendMessage }: ChatPanelProps) {
               <Spin indicator={<LoadingOutlined spin />} size="small" />
               <Text className={styles.processingText}>Agent 正在执行任务...</Text>
             </div>
+            <Text type="warning" className={styles.processingWarning}>
+              ⚠️ 请勿刷新页面或切换会话，否则任务将终止
+            </Text>
             <Button
               type="primary"
               danger

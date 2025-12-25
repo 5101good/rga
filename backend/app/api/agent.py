@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from typing import Optional
+from typing import Optional, Tuple
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -120,14 +120,61 @@ async def validate_session(session_id: str, user_id: str) -> dict:
 async def get_or_create_agent(
     session_id: str,
     session: dict,
+    user_id: str,
     agent_type: str = "glm"
 ) -> BaseAgentService:
     """Get existing agent or create a new one."""
+    db = get_database_service()
+    
     if session_id in _agents:
-        return _agents[session_id]
+        # Agent exists, but verify ADB connection is still valid
+        agent = _agents[session_id]
+        device_id = session.get("device_id")
+        
+        # Quick check if ADB connection is alive
+        if device_id and not await _verify_adb_connection(device_id):
+            logger.warning(f"ADB connection lost for existing agent, attempting reconnect...")
+            success, new_url = await _reconnect_adb(device_id, session.get("agentbay_session_id"))
+            if not success:
+                # Cannot reconnect, need to recreate session
+                del _agents[session_id]
+                raise HTTPException(
+                    status_code=503,
+                    detail="设备连接已断开，请关闭此会话并创建新会话"
+                )
+            # Update resource_url in database if refreshed
+            if new_url:
+                logger.info(f"Updating resource_url for session {session_id}")
+                await db.update_session(
+                    session_id=session_id,
+                    user_id=user_id,
+                    resource_url=new_url
+                )
+        
+        return agent
 
     device_id = session.get("device_id")
     agentbay_session_id = session.get("agentbay_session_id")
+
+    # Verify ADB connection before creating agent
+    logger.info(f"Verifying ADB connection for device {device_id}...")
+    if device_id and not await _verify_adb_connection(device_id):
+        logger.warning(f"ADB connection not available for {device_id}, attempting reconnect...")
+        success, new_url = await _reconnect_adb(device_id, agentbay_session_id)
+        if not success:
+            raise HTTPException(
+                status_code=503,
+                detail="设备连接已断开（可能是服务重启导致），请关闭此会话并创建新会话"
+            )
+        logger.info(f"Successfully reconnected to {device_id}")
+        # Update resource_url in database if refreshed
+        if new_url:
+            logger.info(f"Updating resource_url for session {session_id}")
+            await db.update_session(
+                session_id=session_id,
+                user_id=user_id,
+                resource_url=new_url
+            )
 
     # Use session's agent_type if available
     session_agent_type = session.get("agent_type", agent_type)
@@ -163,6 +210,124 @@ async def get_or_create_agent(
     logger.info(f"Created {agent_type} agent for session {session_id}")
 
     return agent
+
+
+async def _verify_adb_connection(device_id: str) -> bool:
+    """Verify if ADB connection is still alive."""
+    import subprocess
+    
+    try:
+        result = subprocess.run(
+            ["adb", "-s", device_id, "shell", "echo", "ping"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return result.returncode == 0 and "ping" in result.stdout
+    except Exception as e:
+        logger.warning(f"ADB connection check failed: {e}")
+        return False
+
+
+async def _reconnect_adb(device_id: str, agentbay_session_id: str | None) -> Tuple[bool, Optional[str]]:
+    """
+    Try to reconnect ADB and refresh resource URL.
+    
+    Returns:
+        Tuple of (success, new_resource_url)
+        - success: True if ADB reconnected successfully
+        - new_resource_url: Updated resource URL if available, None otherwise
+    """
+    import subprocess
+    import time
+    from app.services.agentbay import get_agentbay_service
+    
+    if not device_id or ":" not in device_id:
+        return False, None
+    
+    new_resource_url = None
+    agentbay_restore_attempted = False
+    
+    try:
+        # First, try to restore the session through AgentBay (gets fresh ADB URL)
+        if agentbay_session_id:
+            logger.info(f"Attempting to restore AgentBay session {agentbay_session_id}...")
+            agentbay_service = get_agentbay_service()
+            agentbay_restore_attempted = True
+            new_resource_url = await agentbay_service.restore_session(agentbay_session_id, device_id)
+            
+            if new_resource_url:
+                logger.info("Session restored with new resource URL")
+                # AgentBay restore_session already handles ADB reconnection
+                # Verify the connection worked
+                verify_result = subprocess.run(
+                    ["adb", "-s", device_id, "shell", "echo", "ping"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if verify_result.returncode == 0 and "ping" in verify_result.stdout:
+                    logger.info("Successfully reconnected via AgentBay restore")
+                    return True, new_resource_url
+            else:
+                # AgentBay session could not be restored (session expired or service restarted)
+                # Direct ADB reconnect is unlikely to work for cloud phones
+                logger.warning(f"AgentBay session {agentbay_session_id} could not be restored (likely expired)")
+                # Still try quick ADB reconnect as a fallback
+        
+        # Fallback: Try direct ADB reconnect (with shorter timeout for cloud phones)
+        # For cloud phones after service restart, this is unlikely to work
+        # but we try anyway with a short timeout
+        reconnect_timeout = 3 if agentbay_restore_attempted else 10
+        logger.info(f"Attempting direct ADB reconnect to {device_id} (timeout={reconnect_timeout}s)...")
+        
+        subprocess.run(
+            ["adb", "disconnect", device_id],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        time.sleep(0.3)
+        
+        result = subprocess.run(
+            ["adb", "connect", device_id],
+            capture_output=True,
+            text=True,
+            timeout=reconnect_timeout,
+        )
+        
+        if "connected" in result.stdout.lower():
+            # Shorter wait if AgentBay restore failed (cloud phone likely gone)
+            stabilize_time = 1 if agentbay_restore_attempted else 2
+            time.sleep(stabilize_time)
+            
+            # Verify the connection
+            verify_result = subprocess.run(
+                ["adb", "-s", device_id, "shell", "echo", "ping"],
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if verify_result.returncode == 0 and "ping" in verify_result.stdout:
+                logger.info(f"Successfully reconnected to {device_id}")
+                # Try to get fresh URL even for direct reconnect
+                if agentbay_session_id:
+                    try:
+                        agentbay_service = get_agentbay_service()
+                        new_resource_url = await agentbay_service.refresh_resource_url(agentbay_session_id)
+                    except Exception:
+                        pass
+                return True, new_resource_url
+        
+        logger.warning(f"Failed to reconnect ADB: stdout={result.stdout.strip()}, stderr={result.stderr.strip()}")
+        return False, None
+        
+    except subprocess.TimeoutExpired:
+        logger.warning(f"ADB reconnect timed out for {device_id}")
+        return False, None
+    except Exception as e:
+        logger.error(f"ADB reconnect error: {e}")
+        return False, None
 
 
 def cleanup_session(session_id: str):
@@ -225,7 +390,7 @@ async def run_task_stream(
             raise HTTPException(status_code=409, detail="A task is already running for this session")
 
     # Get or create agent
-    agent = await get_or_create_agent(session_id_str, session, agent_type)
+    agent = await get_or_create_agent(session_id_str, session, current_user.id, agent_type)
     logger.info(f"[API] Agent ready: type={agent.agent_type}")
 
     task = request.task
