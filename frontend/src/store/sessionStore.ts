@@ -349,9 +349,22 @@ export const useSessionStore = create<SessionState>((set, get) => ({
           onConnectionError: (error) => {
             console.error('SSE connection error:', error);
             const messages = get().messages;
+            
+            // Extract error message from ApiError or use default
+            let errorMessage = '连接错误，请重试';
+            if (error && typeof error === 'object') {
+              // Check for ApiError with status 503 (session expired)
+              const apiError = error as { status?: number; message?: string };
+              if (apiError.status === 503) {
+                errorMessage = apiError.message || '设备连接已断开，请关闭此会话并创建新会话';
+              } else if (apiError.message) {
+                errorMessage = apiError.message;
+              }
+            }
+            
             if (messages.length > 0 && messages[messages.length - 1].isStreaming) {
               get().updateLastMessage({
-                content: '连接错误，请重试',
+                content: errorMessage,
                 isStreaming: false,
               });
             }
