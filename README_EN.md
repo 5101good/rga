@@ -212,3 +212,11 @@ After starting the backend, visit http://localhost:8080/docs for OpenAPI documen
 ## License
 
 Apache 2.0 License
+
+## Acknowledgments
+
+Thanks to the excellent work of the following open source projects and the strong support from the AgentBay team for this project:
+
+- [AgentBay SDK](https://github.com/aliyun/wuying-agentbay-sdk)
+- [Open-AutoGLM](https://github.com/zai-org/Open-AutoGLM)
+- [GELab-Zero](https://github.com/stepfun-ai/gelab-zero)

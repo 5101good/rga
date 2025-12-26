@@ -212,3 +212,11 @@ npm run dev:frontend  # 前端 http://localhost:5173
 ## 许可证
 
 Apache 2.0 License
+
+## 致谢
+
+感谢以下开源项目的优秀工作以及 AgentBay 团队对本项目的大力支持：
+
+- [AgentBay SDK](https://github.com/aliyun/wuying-agentbay-sdk)
+- [Open-AutoGLM](https://github.com/zai-org/Open-AutoGLM)
+- [GELab-Zero](https://github.com/stepfun-ai/gelab-zero)
