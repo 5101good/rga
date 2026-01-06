@@ -10,9 +10,10 @@ Features:
 
 import asyncio
 import time
-from typing import AsyncGenerator, Callable, Optional
+from typing import AsyncGenerator, Callable, Optional, cast
 
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 
 from app.agents.base import BaseAgentService
 from app.agents.gelab.config import GELAB_MAX_STEPS, GELAB_MODEL_CONFIG
@@ -21,8 +22,9 @@ from app.agents.gelab.prompts import build_messages_for_model
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.models import EventType, StreamEvent
-from app.phone_agent.adb import get_screenshot, get_current_app
+from app.phone_agent.adb import get_screenshot
 from app.phone_agent.actions import ActionHandler
+from app.services.agentbay import get_agentbay_service
 
 logger = get_logger("gelab_agent")
 
@@ -141,13 +143,18 @@ class GELabAgentService(BaseAgentService):
         # Get screenshot
         logger.debug(f"[STEP {self._step_count}] Getting screenshot...")
         loop = asyncio.get_event_loop()
-        screenshot = await loop.run_in_executor(None, get_screenshot, self.device_id)
-        current_app = await loop.run_in_executor(None, get_current_app, self.device_id)
+        if settings.use_agentbay_mobile and self.session_id:
+            agentbay_service = get_agentbay_service()
+            screenshot = await loop.run_in_executor(
+                None, agentbay_service.mobile_screenshot_base64, self.session_id
+            )
+        else:
+            screenshot = await loop.run_in_executor(None, get_screenshot, self.device_id)
 
         if self._should_stop:
             return
 
-        logger.debug(f"[STEP {self._step_count}] Screenshot: {screenshot.width}x{screenshot.height}, app={current_app}")
+        logger.debug(f"[STEP {self._step_count}] Screenshot: {screenshot.width}x{screenshot.height}")
 
         # Send screenshot event
         yield StreamEvent(
@@ -173,7 +180,7 @@ class GELabAgentService(BaseAgentService):
 
         try:
             response = self.client.chat.completions.create(
-                messages=messages,
+                messages=cast(list[ChatCompletionMessageParam], messages),
                 model=self.model_name,
                 max_tokens=GELAB_MODEL_CONFIG["max_tokens"],
                 temperature=GELAB_MODEL_CONFIG["temperature"],
@@ -182,7 +189,7 @@ class GELabAgentService(BaseAgentService):
                 stream=False,
             )
 
-            raw_content = response.choices[0].message.content
+            raw_content = response.choices[0].message.content or ""
             thinking_duration = time.time() - thinking_start_time
             logger.info(f"[MODEL] Response completed: {thinking_duration:.2f}s, {len(raw_content)} chars")
             logger.debug(f"[MODEL] Raw response (first 500 chars): {raw_content[:500]}")

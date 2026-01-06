@@ -45,7 +45,7 @@ class BaseAgentService(ABC):
         self._should_stop = False
 
     @abstractmethod
-    async def run_task(
+    def run_task(
         self,
         task: str,
         system_prompt: str,

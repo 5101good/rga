@@ -2,13 +2,14 @@
 
 import asyncio
 import json
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 
 from app.api.auth import get_current_user
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.models import EventType, TaskRequest, TakeoverResponse, UserInfo
 from app.agents.glm.prompts import get_system_prompt
@@ -45,11 +46,11 @@ def check_and_cleanup_stale_task(session_id: str) -> bool:
     Returns True if a stale task was cleaned up.
     """
     import time
-    
+
     task_lock = get_task_lock(session_id)
     if not task_lock.locked():
         return False
-    
+
     start_time = _task_start_times.get(session_id)
     if start_time is None:
         # No start time recorded, assume it's stale
@@ -59,21 +60,21 @@ def check_and_cleanup_stale_task(session_id: str) -> bool:
         if elapsed < TASK_TIMEOUT_SECONDS:
             return False  # Task is still within timeout
         logger.warning(f"Task for session {session_id} timed out after {elapsed:.1f}s, cleaning up")
-    
+
     # Clean up stale task
     try:
         task_lock.release()
     except RuntimeError:
         pass  # Lock wasn't held
-    
+
     _task_running[session_id] = False
     if session_id in _task_start_times:
         del _task_start_times[session_id]
-    
+
     # Stop the agent if it exists
     if session_id in _agents:
         _agents[session_id].stop()
-    
+
     return True
 
 
@@ -107,7 +108,8 @@ async def validate_session(session_id: str, user_id: str) -> dict:
         )
 
     device_id = session.get("device_id")
-    if not device_id:
+    # When use_agentbay_mobile is enabled, we don't require ADB device_id.
+    if not settings.use_agentbay_mobile and not device_id:
         raise HTTPException(status_code=400, detail="No device connected to this session")
 
     agentbay_session_id = session.get("agentbay_session_id")
@@ -125,23 +127,50 @@ async def get_or_create_agent(
 ) -> BaseAgentService:
     """Get existing agent or create a new one."""
     db = get_database_service()
-    
+
     if session_id in _agents:
-        # Agent exists, but verify ADB connection is still valid
+        # Agent exists, but verify ADB connection is still valid (ADB mode only)
         agent = _agents[session_id]
         device_id = session.get("device_id")
-        
-        # Quick check if ADB connection is alive
+
+        if not settings.use_agentbay_mobile:
+            # Quick check if ADB connection is alive
+            if device_id and not await _verify_adb_connection(device_id):
+                logger.warning(f"ADB connection lost for existing agent, attempting reconnect...")
+                success, new_url = await _reconnect_adb(device_id, session.get("agentbay_session_id"))
+                if not success:
+                    # Cannot reconnect, need to recreate session
+                    del _agents[session_id]
+                    raise HTTPException(
+                        status_code=503,
+                        detail="设备连接已断开，请关闭此会话并创建新会话"
+                    )
+                # Update resource_url in database if refreshed
+                if new_url:
+                    logger.info(f"Updating resource_url for session {session_id}")
+                    await db.update_session(
+                        session_id=session_id,
+                        user_id=user_id,
+                        resource_url=new_url
+                    )
+
+        return agent
+
+    device_id = session.get("device_id")
+    agentbay_session_id = session.get("agentbay_session_id")
+
+    # Verify ADB connection before creating agent (ADB mode only)
+    if not settings.use_agentbay_mobile:
+        logger.info(f"Verifying ADB connection for device {device_id}...")
         if device_id and not await _verify_adb_connection(device_id):
-            logger.warning(f"ADB connection lost for existing agent, attempting reconnect...")
-            success, new_url = await _reconnect_adb(device_id, session.get("agentbay_session_id"))
+            logger.warning(f"ADB connection not available for {device_id}, attempting reconnect...")
+            success, new_url = await _reconnect_adb(device_id, agentbay_session_id)
             if not success:
-                # Cannot reconnect, need to recreate session
-                del _agents[session_id]
                 raise HTTPException(
                     status_code=503,
-                    detail="设备连接已断开，请关闭此会话并创建新会话"
+                    detail="设备连接已断开（可能是服务重启导致），请关闭此会话并创建新会话"
                 )
+            logger.info(f"Successfully reconnected to {device_id}")
             # Update resource_url in database if refreshed
             if new_url:
                 logger.info(f"Updating resource_url for session {session_id}")
@@ -150,31 +179,6 @@ async def get_or_create_agent(
                     user_id=user_id,
                     resource_url=new_url
                 )
-        
-        return agent
-
-    device_id = session.get("device_id")
-    agentbay_session_id = session.get("agentbay_session_id")
-
-    # Verify ADB connection before creating agent
-    logger.info(f"Verifying ADB connection for device {device_id}...")
-    if device_id and not await _verify_adb_connection(device_id):
-        logger.warning(f"ADB connection not available for {device_id}, attempting reconnect...")
-        success, new_url = await _reconnect_adb(device_id, agentbay_session_id)
-        if not success:
-            raise HTTPException(
-                status_code=503,
-                detail="设备连接已断开（可能是服务重启导致），请关闭此会话并创建新会话"
-            )
-        logger.info(f"Successfully reconnected to {device_id}")
-        # Update resource_url in database if refreshed
-        if new_url:
-            logger.info(f"Updating resource_url for session {session_id}")
-            await db.update_session(
-                session_id=session_id,
-                user_id=user_id,
-                resource_url=new_url
-            )
 
     # Use session's agent_type if available
     session_agent_type = session.get("agent_type", agent_type)
@@ -190,16 +194,20 @@ async def get_or_create_agent(
     _stop_events[session_id] = stop_event
 
     # Create takeover callback
-    async def on_takeover(message: str):
+    def on_takeover(message: str) -> asyncio.Future:
         """Called when agent requests takeover."""
-        takeover_event.clear()
-        await takeover_event.wait()
+        async def _wait():
+            takeover_event.clear()
+            await takeover_event.wait()
+
+        return asyncio.ensure_future(_wait())
 
     # Create agent instance using factory
     try:
         agent = AgentFactory.create_agent(
             agent_type=agent_type,
-            device_id=device_id,
+            # In AgentBay-mobile mode we may not have ADB device_id.
+            device_id=device_id or "",
             on_takeover=on_takeover,
             session_id=agentbay_session_id,
         )
@@ -215,7 +223,7 @@ async def get_or_create_agent(
 async def _verify_adb_connection(device_id: str) -> bool:
     """Verify if ADB connection is still alive."""
     import subprocess
-    
+
     try:
         result = subprocess.run(
             ["adb", "-s", device_id, "shell", "echo", "ping"],
@@ -232,7 +240,7 @@ async def _verify_adb_connection(device_id: str) -> bool:
 async def _reconnect_adb(device_id: str, agentbay_session_id: str | None) -> Tuple[bool, Optional[str]]:
     """
     Try to reconnect ADB and refresh resource URL.
-    
+
     Returns:
         Tuple of (success, new_resource_url)
         - success: True if ADB reconnected successfully
@@ -241,13 +249,13 @@ async def _reconnect_adb(device_id: str, agentbay_session_id: str | None) -> Tup
     import subprocess
     import time
     from app.services.agentbay import get_agentbay_service
-    
+
     if not device_id or ":" not in device_id:
         return False, None
-    
+
     new_resource_url = None
     agentbay_restore_attempted = False
-    
+
     try:
         # First, try to restore the session through AgentBay (gets fresh ADB URL)
         if agentbay_session_id:
@@ -255,7 +263,7 @@ async def _reconnect_adb(device_id: str, agentbay_session_id: str | None) -> Tup
             agentbay_service = get_agentbay_service()
             agentbay_restore_attempted = True
             new_resource_url = await agentbay_service.restore_session(agentbay_session_id, device_id)
-            
+
             if new_resource_url:
                 logger.info("Session restored with new resource URL")
                 # AgentBay restore_session already handles ADB reconnection
@@ -274,13 +282,13 @@ async def _reconnect_adb(device_id: str, agentbay_session_id: str | None) -> Tup
                 # Direct ADB reconnect is unlikely to work for cloud phones
                 logger.warning(f"AgentBay session {agentbay_session_id} could not be restored (likely expired)")
                 # Still try quick ADB reconnect as a fallback
-        
+
         # Fallback: Try direct ADB reconnect (with shorter timeout for cloud phones)
         # For cloud phones after service restart, this is unlikely to work
         # but we try anyway with a short timeout
         reconnect_timeout = 3 if agentbay_restore_attempted else 10
         logger.info(f"Attempting direct ADB reconnect to {device_id} (timeout={reconnect_timeout}s)...")
-        
+
         subprocess.run(
             ["adb", "disconnect", device_id],
             capture_output=True,
@@ -288,19 +296,19 @@ async def _reconnect_adb(device_id: str, agentbay_session_id: str | None) -> Tup
             timeout=3,
         )
         time.sleep(0.3)
-        
+
         result = subprocess.run(
             ["adb", "connect", device_id],
             capture_output=True,
             text=True,
             timeout=reconnect_timeout,
         )
-        
+
         if "connected" in result.stdout.lower():
             # Shorter wait if AgentBay restore failed (cloud phone likely gone)
             stabilize_time = 1 if agentbay_restore_attempted else 2
             time.sleep(stabilize_time)
-            
+
             # Verify the connection
             verify_result = subprocess.run(
                 ["adb", "-s", device_id, "shell", "echo", "ping"],
@@ -318,10 +326,10 @@ async def _reconnect_adb(device_id: str, agentbay_session_id: str | None) -> Tup
                     except Exception:
                         pass
                 return True, new_resource_url
-        
+
         logger.warning(f"Failed to reconnect ADB: stdout={result.stdout.strip()}, stderr={result.stderr.strip()}")
         return False, None
-        
+
     except subprocess.TimeoutExpired:
         logger.warning(f"ADB reconnect timed out for {device_id}")
         return False, None
@@ -370,7 +378,7 @@ async def run_task_stream(
     - agent_type: Agent type to use ("glm" | "gelab"), default "glm"
     """
     session_id_str = str(session_id)
-    
+
     logger.info(f"[API] Task request: session={session_id_str[:8]}... task={request.task[:50]}{'...' if len(request.task) > 50 else ''}")
 
     # Validate session
@@ -409,12 +417,12 @@ async def run_task_stream(
         """Generate SSE events from agent execution."""
         nonlocal session_id_str
 
-        all_steps = []
-        current_step = {"stepNumber": 0}
+        all_steps: list[dict[str, Any]] = []
+        current_step: dict[str, Any] = {"stepNumber": 0}
         task_completed = False
 
         import time
-        
+
         # Acquire lock for the duration of task execution
         await task_lock.acquire()
         _task_running[session_id_str] = True
@@ -565,7 +573,7 @@ async def stop_task(
 ):
     """
     Stop the currently running task.
-    
+
     Query params:
     - force: If True, forcefully release the task lock even if the task is stuck.
              Use this if a task is stuck and you can't start a new one.
@@ -577,24 +585,23 @@ async def stop_task(
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    # Check if task is running
-    if not _task_running.get(session_id_str, False):
-        # Even if no task is marked as running, check if lock is stuck
-        task_lock = get_task_lock(session_id_str)
-        if task_lock.locked() and force:
-            # Force release the stuck lock
-            try:
-                task_lock.release()
-                logger.info(f"Force released stuck lock for session {session_id_str}")
-                return {"stopped": True, "message": "Force released stuck lock"}
-            except RuntimeError:
-                # Lock was not held, which is fine
-                pass
+    # Stop can be requested in a small window where SSE connection is established
+    # but _task_running hasn't been marked yet (event_generator acquires lock later).
+    # Treat "agent exists" or "task lock is locked" as a stoppable state.
+    task_lock = get_task_lock(session_id_str)
+    is_running = _task_running.get(session_id_str, False)
+    has_agent = session_id_str in _agents
+    lock_locked = task_lock.locked()
+
+    if not is_running and not has_agent and not lock_locked:
         return {"stopped": False, "message": "No task is running"}
 
+    # Ensure stop event exists
+    if session_id_str not in _stop_events:
+        _stop_events[session_id_str] = asyncio.Event()
+
     # Set stop event
-    if session_id_str in _stop_events:
-        _stop_events[session_id_str].set()
+    _stop_events[session_id_str].set()
 
     # Also call stop on the agent directly
     if session_id_str in _agents:
@@ -602,7 +609,6 @@ async def stop_task(
 
     # If force mode, also release the lock and clean up
     if force:
-        task_lock = get_task_lock(session_id_str)
         if task_lock.locked():
             try:
                 task_lock.release()
@@ -614,7 +620,9 @@ async def stop_task(
         _task_running[session_id_str] = False
         return {"stopped": True, "message": "Task force stopped and lock released"}
 
-    return {"stopped": True, "message": "Stop signal sent"}
+    if is_running:
+        return {"stopped": True, "message": "Stop signal sent"}
+    return {"stopped": True, "message": "Stop queued"}
 
 
 @router.post("/{session_id}/takeover/complete", response_model=TakeoverResponse)

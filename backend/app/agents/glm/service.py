@@ -10,9 +10,10 @@ Features:
 
 import asyncio
 import time
-from typing import Any, AsyncGenerator, Callable, Optional
+from typing import Any, AsyncGenerator, Callable, Optional, cast
 
 from openai import OpenAI
+from openai.types.chat import ChatCompletionMessageParam
 
 from app.agents.base import BaseAgentService
 from app.agents.glm.model import MessageBuilder
@@ -20,8 +21,9 @@ from app.agents.glm.prompts import get_system_prompt
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.models import EventType, StreamEvent
-from app.phone_agent.adb import get_screenshot, get_current_app
+from app.phone_agent.adb import get_screenshot
 from app.phone_agent.actions import ActionHandler, parse_action, finish
+from app.services.agentbay import get_agentbay_service
 
 logger = get_logger("glm_agent")
 
@@ -166,7 +168,7 @@ class GLMAgentService(BaseAgentService):
         """Execute a single step of the agent loop."""
         self._step_count += 1
         step_start_time = time.time()
-        
+
         logger.info(f"[STEP {self._step_count}] Starting {'(first step)' if is_first else ''}")
 
         if self._should_stop:
@@ -176,18 +178,28 @@ class GLMAgentService(BaseAgentService):
         # Get screenshot from device
         logger.debug(f"[STEP {self._step_count}] Getting screenshot...")
         loop = asyncio.get_event_loop()
-        screenshot = await loop.run_in_executor(
-            None, get_screenshot, self.device_id
-        )
-        current_app = await loop.run_in_executor(
-            None, get_current_app, self.device_id
-        )
+        if settings.use_agentbay_mobile and self.session_id:
+            agentbay_service = get_agentbay_service()
+            screenshot = await loop.run_in_executor(
+                None, agentbay_service.mobile_screenshot_base64, self.session_id
+            )
+        else:
+            screenshot = await loop.run_in_executor(None, get_screenshot, self.device_id)
+        current_app: str | None = None
+        if settings.phone_agent_include_current_app:
+            # Lazy import to avoid hard ADB dependency when disabled
+            from app.phone_agent.adb import get_current_app  # type: ignore
+
+            current_app = await loop.run_in_executor(None, get_current_app, self.device_id)
 
         if self._should_stop:
             logger.debug("Stop flag detected after screenshot")
             return
 
-        logger.debug(f"[STEP {self._step_count}] Screenshot: {screenshot.width}x{screenshot.height}, app={current_app}")
+        logger.debug(
+            f"[STEP {self._step_count}] Screenshot: {screenshot.width}x{screenshot.height}"
+            + (f", app={current_app}" if current_app else "")
+        )
 
         # Send screenshot event
         yield StreamEvent(
@@ -233,7 +245,7 @@ class GLMAgentService(BaseAgentService):
 
         try:
             stream = self.client.chat.completions.create(
-                messages=self._context,
+                messages=cast(list[ChatCompletionMessageParam], self._context),
                 model=self.model_name,
                 max_tokens=3000,
                 temperature=0.0,

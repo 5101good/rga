@@ -46,7 +46,9 @@ class MessageBuilder:
         return message
 
     @staticmethod
-    def build_screen_info(current_app: str, **extra_info) -> str:
+    def build_screen_info(current_app: str | None = None, **extra_info) -> str:
         """Build screen info string for the model."""
-        info = {"current_app": current_app, **extra_info}
+        info: dict[str, Any] = {**extra_info}
+        if current_app:
+            info["current_app"] = current_app
         return json.dumps(info, ensure_ascii=False)

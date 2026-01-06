@@ -37,6 +37,7 @@ def _dict_to_session_response(data: dict) -> SessionResponse:
 @router.post("", response_model=SessionResponse)
 async def create_session(
     request: SessionCreate,
+
     current_user: UserInfo = Depends(get_current_user),
 ):
     """
@@ -64,7 +65,7 @@ async def create_session(
                 "reset_time": "明天 00:00 重置"
             }
         )
-    
+
     # 2. Check active sessions limit
     active_count = await db.count_active_sessions(current_user.id)
     if active_count >= settings.max_active_sessions:
@@ -86,14 +87,14 @@ async def create_session(
         status="creating",
         agent_type=request.agent_type,
     )
-    
+
     session_id = session_data["id"]
-    
+
     try:
         # Create AgentBay session
         agentbay_service = get_agentbay_service()
         ab_session: AgentBaySession = await agentbay_service.create_session()
-        
+
         # Update session with AgentBay details
         updated = await db.update_session(
             session_id=session_id,
@@ -103,14 +104,16 @@ async def create_session(
             device_id=ab_session.device_id,
             status="active",
         )
-        
+
         if updated:
             return _dict_to_session_response(updated)
-        
+
         # Fallback: re-fetch
         session_data = await db.get_session(session_id, current_user.id)
+        if not session_data:
+            raise HTTPException(status_code=500, detail="Failed to load created session")
         return _dict_to_session_response(session_data)
-        
+
     except Exception as e:
         # Update status to error
         await db.update_session(
@@ -118,7 +121,7 @@ async def create_session(
             user_id=current_user.id,
             status="error",
         )
-        
+
         raise HTTPException(
             status_code=500,
             detail=f"Failed to create session: {str(e)}",
@@ -143,10 +146,10 @@ async def get_session(
     """Get session by ID."""
     db = get_database_service()
     session = await db.get_session(str(session_id), current_user.id)
-    
+
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     return _dict_to_session_response(session)
 
 
@@ -157,15 +160,15 @@ async def get_conversations(
 ):
     """Get conversation history for a session."""
     db = get_database_service()
-    
+
     # Verify session belongs to user
     session = await db.get_session(str(session_id), current_user.id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     # Get conversations
     conversations = await db.list_conversations(str(session_id))
-    
+
     return {"conversations": conversations}
 
 
@@ -177,10 +180,10 @@ async def delete_session(
     """Delete/close a session."""
     db = get_database_service()
     session = await db.get_session(str(session_id), current_user.id)
-    
+
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    
+
     # Close AgentBay session
     if session.get("agentbay_session_id"):
         try:
@@ -188,8 +191,8 @@ async def delete_session(
             await agentbay_service.close_session(session["agentbay_session_id"])
         except Exception as e:
             logger.warning(f"Failed to close AgentBay session: {e}")
-    
+
     # Update status to closed
     await db.delete_session(str(session_id), current_user.id)
-    
+
     return {"status": "deleted", "session_id": str(session_id)}

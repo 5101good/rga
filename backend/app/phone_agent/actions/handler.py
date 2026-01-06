@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from app.core.config import settings
 from app.core.logging import get_logger
 from app.phone_agent.adb import (
     back,
@@ -50,7 +51,7 @@ class ActionHandler:
         """Execute an action from the AI model."""
         import time
         start_time = time.time()
-        
+
         action_type = action.get("_metadata")
 
         if action_type == "finish":
@@ -67,7 +68,7 @@ class ActionHandler:
                 message=f"Unknown action type: {action_type}",
             )
 
-        action_name = action.get("action")
+        action_name = action.get("action") or ""
         handler_method = self._get_handler(action_name)
 
         if handler_method is None:
@@ -130,6 +131,15 @@ class ActionHandler:
         if not app_name:
             return ActionResult(False, False, "No app name specified")
 
+        if settings.use_agentbay_mobile and self.session_id:
+            agentbay_service = get_agentbay_service()
+            ok, err = agentbay_service.mobile_start_app(self.session_id, app_name)
+            if ok:
+                return ActionResult(True, False)
+            logger.warning(f"[SDK] Launch failed, fallback to ADB: {err}")
+            if not self.device_id:
+                return ActionResult(False, False, f"Launch failed (no ADB fallback): {err}")
+
         success = launch_app(app_name, self.device_id)
         if success:
             return ActionResult(True, False)
@@ -151,7 +161,17 @@ class ActionHandler:
                     message="User cancelled sensitive operation",
                 )
 
-        tap(x, y, self.device_id)
+        if settings.use_agentbay_mobile and self.session_id:
+            agentbay_service = get_agentbay_service()
+            ok, err = agentbay_service.mobile_tap(self.session_id, x, y)
+            if not ok:
+                logger.warning(f"[SDK] Tap failed, fallback to ADB: {err}")
+                if self.device_id:
+                    tap(x, y, self.device_id)
+                else:
+                    return ActionResult(False, False, f"Tap failed (no ADB fallback): {err}")
+        else:
+            tap(x, y, self.device_id)
         return ActionResult(True, False)
 
     def _handle_type(self, action: dict, width: int, height: int) -> ActionResult:
@@ -159,31 +179,16 @@ class ActionHandler:
         text = action.get("text", "")
         logger.info(f"[ADB] Type text: '{text[:50]}{'...' if len(text) > 50 else ''}'")
 
-        # Get AgentBay session
-        agentbay_service = get_agentbay_service()
-        session = agentbay_service.get_session(self.session_id)
-        logger.debug(f"[ADB] Type using AgentBay session: {self.session_id}")
-
-        if not session:
-            logger.warning("[ADB] Type failed: session not found")
+        if not self.session_id:
+            logger.warning("[SDK] Type failed: session_id is missing")
             return ActionResult(False, False, "Session not found")
 
-        # Use native AgentBay input
-        try:
-            import time
-            start_time = time.time()
-            result = session.mobile.input_text(text)
-            duration = time.time() - start_time
-
-            if not result.success:
-                logger.warning(f"[ADB] Type failed: {result.error_message}")
-                return ActionResult(False, False, f"Input failed: {result.error_message}")
-            
-            logger.debug(f"[ADB] Type completed in {duration:.3f}s")
-            return ActionResult(True, False)
-        except Exception as e:
-            logger.error(f"[ADB] Type exception: {e}")
-            return ActionResult(False, False, f"Input failed: {str(e)}")
+        agentbay_service = get_agentbay_service()
+        ok, err = agentbay_service.mobile_input_text(self.session_id, text)
+        if not ok:
+            logger.warning(f"[SDK] Type failed: {err}")
+            return ActionResult(False, False, f"Input failed: {err}")
+        return ActionResult(True, False)
 
     def _handle_swipe(self, action: dict, width: int, height: int) -> ActionResult:
         """Handle swipe action."""
@@ -196,17 +201,49 @@ class ActionHandler:
         start_x, start_y = self._convert_relative_to_absolute(start, width, height)
         end_x, end_y = self._convert_relative_to_absolute(end, width, height)
 
-        swipe(start_x, start_y, end_x, end_y, device_id=self.device_id)
+        if settings.use_agentbay_mobile and self.session_id:
+            agentbay_service = get_agentbay_service()
+            ok, err = agentbay_service.mobile_swipe(
+                self.session_id, start_x, start_y, end_x, end_y
+            )
+            if not ok:
+                logger.warning(f"[SDK] Swipe failed, fallback to ADB: {err}")
+                if self.device_id:
+                    swipe(start_x, start_y, end_x, end_y, device_id=self.device_id)
+                else:
+                    return ActionResult(False, False, f"Swipe failed (no ADB fallback): {err}")
+        else:
+            swipe(start_x, start_y, end_x, end_y, device_id=self.device_id)
         return ActionResult(True, False)
 
     def _handle_back(self, action: dict, width: int, height: int) -> ActionResult:
         """Handle back button action."""
-        back(self.device_id)
+        if settings.use_agentbay_mobile and self.session_id:
+            agentbay_service = get_agentbay_service()
+            ok, err = agentbay_service.mobile_send_key(self.session_id, 4)
+            if not ok:
+                logger.warning(f"[SDK] Back failed, fallback to ADB: {err}")
+                if self.device_id:
+                    back(self.device_id)
+                else:
+                    return ActionResult(False, False, f"Back failed (no ADB fallback): {err}")
+        else:
+            back(self.device_id)
         return ActionResult(True, False)
 
     def _handle_home(self, action: dict, width: int, height: int) -> ActionResult:
         """Handle home button action."""
-        home(self.device_id)
+        if settings.use_agentbay_mobile and self.session_id:
+            agentbay_service = get_agentbay_service()
+            ok, err = agentbay_service.mobile_send_key(self.session_id, 3)
+            if not ok:
+                logger.warning(f"[SDK] Home failed, fallback to ADB: {err}")
+                if self.device_id:
+                    home(self.device_id)
+                else:
+                    return ActionResult(False, False, f"Home failed (no ADB fallback): {err}")
+        else:
+            home(self.device_id)
         return ActionResult(True, False)
 
     def _handle_double_tap(self, action: dict, width: int, height: int) -> ActionResult:
@@ -216,7 +253,17 @@ class ActionHandler:
             return ActionResult(False, False, "No element coordinates")
 
         x, y = self._convert_relative_to_absolute(element, width, height)
-        double_tap(x, y, self.device_id)
+        if settings.use_agentbay_mobile and self.session_id:
+            agentbay_service = get_agentbay_service()
+            ok, err = agentbay_service.mobile_double_tap(self.session_id, x, y)
+            if not ok:
+                logger.warning(f"[SDK] Double tap failed, fallback to ADB: {err}")
+                if self.device_id:
+                    double_tap(x, y, self.device_id)
+                else:
+                    return ActionResult(False, False, f"Double tap failed (no ADB fallback): {err}")
+        else:
+            double_tap(x, y, self.device_id)
         return ActionResult(True, False)
 
     def _handle_long_press(self, action: dict, width: int, height: int) -> ActionResult:
@@ -226,7 +273,17 @@ class ActionHandler:
             return ActionResult(False, False, "No element coordinates")
 
         x, y = self._convert_relative_to_absolute(element, width, height)
-        long_press(x, y, device_id=self.device_id)
+        if settings.use_agentbay_mobile and self.session_id:
+            agentbay_service = get_agentbay_service()
+            ok, err = agentbay_service.mobile_long_press(self.session_id, x, y)
+            if not ok:
+                logger.warning(f"[SDK] Long press failed, fallback to ADB: {err}")
+                if self.device_id:
+                    long_press(x, y, device_id=self.device_id)
+                else:
+                    return ActionResult(False, False, f"Long press failed (no ADB fallback): {err}")
+        else:
+            long_press(x, y, device_id=self.device_id)
         return ActionResult(True, False)
 
     def _handle_wait(self, action: dict, width: int, height: int) -> ActionResult:
@@ -290,6 +347,9 @@ def parse_action(response: str) -> dict[str, Any]:
                 action = {"_metadata": "do"}
                 for keyword in call.keywords:
                     key = keyword.arg
+                    if key is None:
+                        # Skip **kwargs or unsupported syntax
+                        continue
                     value = ast.literal_eval(keyword.value)
                     action[key] = value
 

@@ -70,6 +70,15 @@ class Settings(BaseSettings):
     port: int = 8080
     debug: bool = False
 
+    # Feature flags
+    # When enabled, use AgentBay SDK mobile primitives (tap/swipe/send_key/screenshot/start_app)
+    # to replace local adb subprocess-based primitives. (get_current_app remains adb-based.)
+    use_agentbay_mobile: bool = True
+
+    # When enabled, fetch current foreground app via ADB and include it in the prompt.
+    # To remove ADB dependency in the agent loop, set PHONE_AGENT_INCLUDE_CURRENT_APP=false.
+    phone_agent_include_current_app: bool = False
+
     # Logging
     log_level: str = "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
     log_to_file: bool = False  # Whether to save logs to file
